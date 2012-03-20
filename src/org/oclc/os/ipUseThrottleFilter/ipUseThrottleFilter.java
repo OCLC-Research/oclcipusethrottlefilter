@@ -35,7 +35,8 @@ public class ipUseThrottleFilter implements Filter {
     static Log log=LogFactory.getLog(ipUseThrottleFilter.class);
     static final ConcurrentHashMap<String, Integer> simultaneousRequests=new ConcurrentHashMap<String, Integer>();
     static final HashMap<String, Integer> totalRequests=new HashMap<String, Integer>();
-    static int maxSimultaneousRequests=3, nextReportingHour;
+    static int maxSimultaneousRequests=3, maxTotalSimultaneousRequests=10, nextReportingHour;
+    static int totalSimultaneousRequests=0;
     static String contactInfo=null;
 
     @Override
@@ -51,22 +52,48 @@ public class ipUseThrottleFilter implements Filter {
             log.error("Bad value for parameter 'maxSimultaneousRequests': '"+t+"'");
             log.error("Using the default value of 3 instead");
         }
+
+        t=fc.getInitParameter("maxTotalSimultaneousRequests");
+        if(t!=null)
+        try {
+            maxTotalSimultaneousRequests=Integer.parseInt(t);
+        }
+        catch(Exception e) {
+            log.error("Bad value for parameter 'maxTotalSimultaneousRequests': '"+t+"'");
+            log.error("Using the default value of 10 instead");
+        }
+
         contactInfo=fc.getInitParameter("contactInfo");
     }
 
     @Override
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
-        String addr=request.getRemoteAddr();
+        String longAddr=request.getRemoteAddr();
+        String shortAddr=longAddr.substring(0, longAddr.lastIndexOf('.')); // trim off 4th number group
+        // that lets us spot requests from clusters
         int count;
         synchronized(simultaneousRequests) {
-            Integer icount=simultaneousRequests.get(addr);
+            if(totalSimultaneousRequests>=maxTotalSimultaneousRequests) {
+                log.error("This system has exceeded the maxTotalSimultaneousRequests limit of "+maxTotalSimultaneousRequests);
+                ((HttpServletResponse)response).setStatus(HttpURLConnection.HTTP_UNAVAILABLE);
+                response.setContentType("text/html");
+                PrintWriter writer = response.getWriter();
+                writer.println( "<html><body><h1>Service Temporarily Unavailable</h1>" );
+                writer.println( "The system is experiencing a severe load and is temporarily unable to accept new requests");
+                if(contactInfo!=null)
+                    writer.println("<p>Contact "+contactInfo+" for more information</p>");
+                writer.println("</body></html>");
+                writer.close();
+                return;
+            }
+            Integer icount=simultaneousRequests.get(shortAddr);
             if(icount!=null)
                 count=icount.intValue();
             else
                 count=0;
 
             if(count>maxSimultaneousRequests) {
-                log.error("IP addr "+addr+" has exceeded "+maxSimultaneousRequests+" simultaneous requests!");
+                log.error("IP addr "+shortAddr+".* has exceeded "+maxSimultaneousRequests+" simultaneous requests!");
                 ((HttpServletResponse)response).setStatus(HttpURLConnection.HTTP_FORBIDDEN);
                 response.setContentType("text/html");
                 PrintWriter writer = response.getWriter();
@@ -79,30 +106,40 @@ public class ipUseThrottleFilter implements Filter {
                 writer.close();
                 return;
             }
-            simultaneousRequests.put(addr, count+1);
-            icount=totalRequests.get(addr);
+            simultaneousRequests.put(shortAddr, count+1);
+            icount=totalRequests.get(shortAddr);
             if(icount!=null)
                 count=icount.intValue();
             else
                 count=0;
-            totalRequests.put(addr, count+1);
+            totalRequests.put(shortAddr, count+1);
+            totalSimultaneousRequests++;
         }
 
-        HttpServletResponseWrapper wrapper = new HttpServletResponseWrapper((HttpServletResponse)response);
-        chain.doFilter(request, wrapper);
-
-        synchronized(simultaneousRequests) {
-            count=simultaneousRequests.get(addr);
-            simultaneousRequests.put(addr, count-1);
+        try {
+            HttpServletResponseWrapper wrapper = new HttpServletResponseWrapper((HttpServletResponse)response);
+            chain.doFilter(request, wrapper);
+        }
+        finally {
+            synchronized(simultaneousRequests) {
+                totalSimultaneousRequests--;
+                count=simultaneousRequests.get(shortAddr);
+                if(count==1) // prune them from the table
+                    simultaneousRequests.remove(shortAddr);
+                else
+                    simultaneousRequests.put(shortAddr, count-1);
+            }
         }
 
         Calendar c=new GregorianCalendar();
         int hour=c.get(Calendar.HOUR_OF_DAY);
         if(hour==0 && nextReportingHour==24) { // new day!
+            // you could reset your daily limits table here
             nextReportingHour=0;
         }
 
         if(hour>=nextReportingHour) { // generate the hourly report
+            // you could reset your hourly limits table here
             nextReportingHour=hour+1;
 
             if(log.isInfoEnabled()) {
@@ -110,7 +147,7 @@ public class ipUseThrottleFilter implements Filter {
                 List<String> yourMapKeys = new ArrayList(totalRequests.keySet());
                 List<Integer> yourMapValues = new ArrayList(totalRequests.values());
                 TreeSet<Integer> sortedSet = new TreeSet(yourMapValues);
-                Integer[] sortedArray = sortedSet.toArray(new Integer[0]);
+                Integer[] sortedArray = sortedSet.descendingSet().toArray(new Integer[0]);
                 int size = sortedArray.length;
 
                 for (int i=0; i<size; i++)
@@ -118,11 +155,12 @@ public class ipUseThrottleFilter implements Filter {
                         sortedArray[i]);
                 Iterator<String> it=map.keySet().iterator();
                 String key;
-                log.info("top 10 users");
+                StringBuilder sb=new StringBuilder("Top 10 users in the last hour");
                 for(int i=0; i<10 && it.hasNext(); i++) {
                     key=it.next();
-                    log.info("    "+key+" : "+map.get(key));
+                    sb.append("\n    ").append(key).append(" : ").append(map.get(key));
                 }
+                log.info(sb);
             }
         }
     }
